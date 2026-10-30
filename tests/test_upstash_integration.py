@@ -10,7 +10,7 @@ Design guarantees:
     (``tests/integration_probe.py``): write in process A, read/verify in
     process B — genuine cross-process persistence in real Upstash.
   * All writes use the ``test:vox-monitor:`` key prefix; production keys
-    (``vox:doomsday:sessions`` / ``vox:doomsday:lock``) are only ever READ
+    (``vox:monitor:sessions`` / ``vox:monitor:lock``) are only ever READ
     and a final test asserts no test data leaked into them.
   * Telegram code is never imported or invoked; no messages are sent.
   * Secrets are passed via child environment only — never printed.

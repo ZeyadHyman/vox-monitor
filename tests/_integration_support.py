@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 # Every key the integration tests create lives under this prefix so they can
-# never collide with production state (vox:doomsday:sessions / vox:doomsday:lock).
+# never collide with production state (vox:monitor:sessions / vox:monitor:lock).
 TEST_PREFIX = "test:vox-monitor:"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

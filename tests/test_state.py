@@ -191,8 +191,8 @@ def test_full_sequence_alerts_only_on_real_changes():
 
 def test_redis_store_default_keys_match_production():
     store = RedisRestStore("https://example.upstash.io", "token-example")
-    assert store.sessions_key == "vox:doomsday:sessions"
-    assert store.lock_key == "vox:doomsday:lock"
+    assert store.sessions_key == "vox:monitor:sessions"
+    assert store.lock_key == "vox:monitor:lock"
 
 
 def test_redis_store_custom_prefix_isolates_test_namespace():
@@ -264,3 +264,25 @@ def test_load_states_returns_empty_on_unexpected_shapes():
     assert store.load_states() == {}
     store._command = lambda command: None
     assert store.load_states() == {}
+
+
+def test_memory_store_remove_states():
+    store = MemoryStore()
+    store.save_states({"a": SessionState("bookable", NOW, NOW, NOW)})
+    store.save_states({"b": SessionState("bookable", NOW, NOW, NOW)})
+    store.remove_states(["a", "missing"])
+    assert list(store.load_states()) == ["b"]
+
+
+def test_redis_store_remove_states_sends_hdel_for_those_keys_only():
+    store = RedisRestStore("https://example.upstash.io", "token-example")
+    seen: list[list] = []
+    store._command = lambda command: seen.append(command) or 1
+    store.remove_states(["k1", "k2"])
+    assert seen == [["HDEL", "vox:monitor:sessions", "k1", "k2"]]
+
+
+def test_redis_store_remove_states_empty_is_noop():
+    store = RedisRestStore("https://example.upstash.io", "token-example")
+    store._command = lambda command: (_ for _ in ()).throw(AssertionError("must not call"))
+    store.remove_states([])  # must not raise, must not issue a command

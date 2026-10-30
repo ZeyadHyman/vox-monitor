@@ -1,6 +1,8 @@
+import dataclasses
+
 import pytest
 
-from vox_monitor.config import ConfigError, Settings, is_safe_slug, showtimes_url
+from vox_monitor.config import ConfigError, Settings, showtimes_url
 
 
 def base_env(**overrides):
@@ -16,11 +18,18 @@ def base_env(**overrides):
 
 
 def test_from_env_parses_settings():
-    s = Settings.from_env(base_env(DRY_RUN="1", CINEMA_SLUGS="a-b,c-d"))
+    s = Settings.from_env(base_env(DRY_RUN="1"))
     assert s.dry_run is True
-    assert s.cinema_slugs_override == ("a-b", "c-d")
     assert s.redis_url == "https://redis.example"  # trailing slash stripped
     assert s.monitor_secret == "s"
+
+
+def test_cinema_scope_cannot_be_widened_by_env():
+    """CINEMA_SLUGS must no longer exist: scope is hard-coded to Almaza."""
+    s = Settings.from_env(base_env(CINEMA_SLUGS="mall-of-egypt,city-centre-alexandria"))
+    field_names = {f.name for f in dataclasses.fields(Settings)}
+    assert "cinema_slugs_override" not in field_names
+    assert not hasattr(s, "cinema_slugs_override")
 
 
 def test_missing_env_lists_names_not_values():
@@ -37,27 +46,27 @@ def test_bad_int_env_raises():
         Settings.from_env(base_env(MAX_WORKERS="many"))
 
 
-def test_showtimes_url_builds_query():
-    url = showtimes_url(
-        "city-centre-almaza",
-        ("avengers-doomsday", "avengers-doomsday-infinity-vision"),
-        "20261223",
-    )
-    assert url == (
-        "https://egy.voxcinemas.com/showtimes?c=city-centre-almaza"
-        "&m=avengers-doomsday&m=avengers-doomsday-infinity-vision&d=20261223"
-    )
+def test_showtimes_url_has_no_movie_params():
+    # No m= params: VOX then renders EVERY movie at the cinema, which is
+    # what makes automatic all-movie discovery work.
+    url = showtimes_url("city-centre-almaza", "20261223")
+    assert url == "https://egy.voxcinemas.com/showtimes?c=city-centre-almaza&d=20261223"
+    assert "m=" not in url
 
 
 def test_showtimes_url_without_date():
-    url = showtimes_url("mall-of-egypt", ("avengers-doomsday",))
-    assert url == "https://egy.voxcinemas.com/showtimes?c=mall-of-egypt&m=avengers-doomsday"
+    url = showtimes_url("city-centre-almaza")
+    assert url == "https://egy.voxcinemas.com/showtimes?c=city-centre-almaza"
+    assert "m=" not in url
+    assert "d=" not in url
 
 
-def test_is_safe_slug():
-    assert is_safe_slug("city-centre-almaza")
-    assert not is_safe_slug("../etc")
-    assert not is_safe_slug("")
+def test_slug_validator_removed_with_discovery():
+    # No user-supplied slugs remain (single hard-coded cinema), so the
+    # validation helper went away with discovery.
+    import vox_monitor.config as config_module
+
+    assert not hasattr(config_module, "is_safe_slug")
 
 
 def test_secret_comparison_uses_constant_time():

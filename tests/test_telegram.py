@@ -26,7 +26,7 @@ def test_format_date():
 
 def test_alert_message_contains_confirmed_fields():
     text = format_alert_message([make_session()])
-    assert "AVENGERS: DOOMSDAY — TICKETS AVAILABLE" in text
+    assert "NEW TICKETS AVAILABLE" in text
     assert "Avengers: Doomsday (Infinity Vision)" in text
     assert "City Centre Almaza" in text
     assert "19 December 2026" in text
@@ -34,6 +34,24 @@ def test_alert_message_contains_confirmed_fields():
     assert "MAX" in text
     assert "Confirmed bookable" in text
     assert "https://egy.voxcinemas.com/booking/0047-276988" in text
+
+
+def test_alert_message_is_generic_not_single_movie():
+    """The monitor covers all films: no title may be hardcoded in the header."""
+    other = Session(
+        **{
+            **make_session().to_dict(),
+            "movie_slug": "clayface",
+            "movie_name": "Clayface",
+            "movie_id": "HO00013587",
+            "session_id": "0047-555001",
+            "booking_url": "https://egy.voxcinemas.com/booking/0047-555001",
+        }
+    )
+    text = format_alert_message([other])
+    assert "NEW TICKETS AVAILABLE" in text
+    assert "Clayface" in text
+    assert "DOOMSDAY" not in text.upper()
 
 
 def test_alert_message_without_booking_url_uses_showtimes_fallback():

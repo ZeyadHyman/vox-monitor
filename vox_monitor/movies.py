@@ -1,8 +1,17 @@
-"""Movie registry for the monitored titles."""
+"""Dynamically discovered movies — no hardcoded registry.
+
+Movies are discovered from the server-rendered Almaza showtimes pages:
+every ``<article class="movie-compare" data-slug="...">`` contributes a
+slug, a display name (its ``<h2>``), and a movie id (the ``B_<HO id>_``
+prefix of its hero image) when those are available. The set updates itself
+automatically as films come on or drop off sale — nothing is pinned to a
+single title.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -12,21 +21,25 @@ class Movie:
     movie_id: str
 
 
-MOVIES: tuple[Movie, ...] = (
-    Movie("avengers-doomsday", "Avengers: Doomsday", "HO00013527"),
-    Movie(
-        "avengers-doomsday-infinity-vision",
-        "Avengers: Doomsday (Infinity Vision)",
-        "HO00013676",
-    ),
-)
+def merge_movies(groups: Iterable[Iterable[Movie]]) -> list[Movie]:
+    """Union movies by slug, filling missing name/id from any group.
 
-_BY_SLUG = {m.slug: m for m in MOVIES}
-
-
-def by_slug(slug: str) -> Movie | None:
-    return _BY_SLUG.get(slug)
-
-
-def movie_slugs() -> tuple[str, ...]:
-    return tuple(m.slug for m in MOVIES)
+    The same film appears on several date pages; identity is the slug.
+    Names/ids missing on one page (e.g. a partially rendered article) are
+    filled in from another page where available.
+    """
+    merged: dict[str, Movie] = {}
+    for group in groups:
+        for movie in group:
+            if not movie.slug:
+                continue
+            prev = merged.get(movie.slug)
+            if prev is None:
+                merged[movie.slug] = movie
+            else:
+                merged[movie.slug] = Movie(
+                    slug=movie.slug,
+                    name=prev.name or movie.name,
+                    movie_id=prev.movie_id or movie.movie_id,
+                )
+    return list(merged.values())

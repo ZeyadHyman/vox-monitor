@@ -1,51 +1,34 @@
-from vox_monitor.cinemas import FALLBACK_CINEMAS, discover_cinemas
-from vox_monitor.http import HttpFetchError, HttpResponse
-from vox_monitor.showtimes import parse_cinemas_page
+"""Monitoring scope tests: City Centre Almaza only, nothing else."""
+
+from vox_monitor.cinemas import MONITORED_CINEMA
 
 
-def test_parses_cinemas_index(fixture_html):
-    cinemas = parse_cinemas_page(fixture_html("cinemas_index.html"))
-    by_slug = {c.slug: c.name for c in cinemas}
-    assert by_slug == {
-        "city-centre-almaza": "City Centre Almaza",
-        "city-centre-alexandria": "City Centre Alexandria",
-        "mall-of-egypt": "Mall of Egypt",
+def test_single_monitored_cinema_is_almaza():
+    assert MONITORED_CINEMA.slug == "city-centre-almaza"
+    assert MONITORED_CINEMA.name == "City Centre Almaza"
+
+
+def test_no_other_cinema_constants_exist():
+    import vox_monitor.cinemas as cinemas_module
+
+    exported = {
+        name
+        for name in dir(cinemas_module)
+        if not name.startswith("_") and name != "annotations"
     }
+    # Only the single monitored cinema (plus module metadata) is exported —
+    # there is no fallback list that could widen the scope.
+    assert exported == {"MONITORED_CINEMA", "Cinema"}
+    assert cinemas_module.MONITORED_CINEMA.slug != "mall-of-egypt"
+    assert cinemas_module.MONITORED_CINEMA.slug != "city-centre-alexandria"
 
 
-class _FakeClient:
-    def __init__(self, response=None, error=None):
-        self._response = response
-        self._error = error
+def test_cinema_discovery_removed_entirely():
+    import vox_monitor.cinemas as cinemas_module
 
-    def get(self, url):
-        if self._error:
-            raise self._error
-        return self._response
+    assert not hasattr(cinemas_module, "discover_cinemas")
+    assert not hasattr(cinemas_module, "FALLBACK_CINEMAS")
 
+    import vox_monitor.showtimes as showtimes_module
 
-def test_discovery_falls_back_on_fetch_error():
-    client = _FakeClient(error=HttpFetchError("boom"))
-    cinemas, discovered = discover_cinemas(client)
-    assert discovered is False
-    assert [c.slug for c in cinemas] == [c.slug for c in FALLBACK_CINEMAS]
-
-
-def test_discovery_falls_back_on_empty_page():
-    client = _FakeClient(response=HttpResponse(200, "<html></html>"))
-    cinemas, discovered = discover_cinemas(client)
-    assert discovered is False
-    assert cinemas == list(FALLBACK_CINEMAS)
-
-
-def test_override_slugs_used_without_fetch():
-    client = _FakeClient(error=HttpFetchError("should not be called"))
-    cinemas, discovered = discover_cinemas(client, ("mall-of-egypt",))
-    assert discovered is False
-    assert [(c.slug, c.name) for c in cinemas] == [("mall-of-egypt", "Mall of Egypt")]
-
-
-def test_override_filters_unsafe_slugs():
-    client = _FakeClient()
-    cinemas, _ = discover_cinemas(client, ("mall-of-egypt", "../evil", "ok-slug"))
-    assert [c.slug for c in cinemas] == ["mall-of-egypt", "ok-slug"]
+    assert not hasattr(showtimes_module, "parse_cinemas_page")

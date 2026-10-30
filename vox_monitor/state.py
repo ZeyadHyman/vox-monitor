@@ -3,10 +3,14 @@
 State model
 -----------
 All sessions seen on showtime pages (bookable or unavailable) are stored in
-one Redis hash ``vox:doomsday:sessions``: field = session key, value = JSON
+one Redis hash ``vox:monitor:sessions``: field = session key, value = JSON
 ``SessionState``. A session key is::
 
     movie_id|cinema_slug|date|time_label|format|session_id
+
+The movie segment keeps sessions of different films strictly distinct while
+the store stays a single hash, so monitoring all movies at the cinema needs
+no structural change.
 
 Notification rules (see ``decide_updates``):
   * BOOKABLE and no prior entry            -> alert (new session)
@@ -15,7 +19,7 @@ Notification rules (see ``decide_updates``):
   * BOOKABLE, prior bookable, notified     -> no alert (deduplicated)
   * UNAVAILABLE / UNKNOWN                  -> update only, never alert
 
-A cycle lock (``vox:doomsday:lock``, SET NX EX) prevents overlapping runs.
+A cycle lock (``vox:monitor:lock``, SET NX EX) prevents overlapping runs.
 """
 
 from __future__ import annotations
@@ -36,18 +40,19 @@ class SessionStore(Protocol):
     def release_lock(self) -> None: ...
     def load_states(self) -> dict[str, SessionState]: ...
     def save_states(self, entries: dict[str, SessionState]) -> None: ...
+    def remove_states(self, keys: list[str]) -> None: ...
 
 
 class RedisRestStore:
     """Upstash Redis REST API client (JSON command protocol).
 
     ``key_prefix`` isolates namespaces: production uses the default
-    ``vox:doomsday:`` (keys ``vox:doomsday:sessions`` / ``vox:doomsday:lock``),
+    ``vox:monitor:`` (keys ``vox:monitor:sessions`` / ``vox:monitor:lock``),
     integration tests use ``test:vox-monitor:`` so they can never touch or
     delete production state.
     """
 
-    DEFAULT_PREFIX = "vox:doomsday:"
+    DEFAULT_PREFIX = "vox:monitor:"
 
     def __init__(
         self,
@@ -148,6 +153,16 @@ class RedisRestStore:
         result = self._command(["DEL", self._sessions_key])
         return int(result) if isinstance(result, (int, float)) else 0
 
+    def remove_states(self, keys: list[str]) -> None:
+        """Delete specific session entries (e.g. dates that have passed).
+
+        Only ever called with keys already present in memory; never deletes
+        wholesale, and never as a reaction to a fetch failure.
+        """
+        if not keys:
+            return
+        self._command(["HDEL", self._sessions_key, *keys])
+
 
 class MemoryStore:
     """In-memory store for tests and local dry runs."""
@@ -170,6 +185,10 @@ class MemoryStore:
 
     def save_states(self, entries: dict[str, SessionState]) -> None:
         self._states.update(entries)
+
+    def remove_states(self, keys: list[str]) -> None:
+        for key in keys:
+            self._states.pop(key, None)
 
 
 @dataclass

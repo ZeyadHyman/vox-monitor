@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 BASE_URL = "https://egy.voxcinemas.com"
 
@@ -33,9 +33,12 @@ class Settings:
     request_timeout: float = 12.0
     cycle_budget_seconds: float = 45.0
     politeness_delay: float = 0.4
-    max_dates_per_cinema: int = 21
+    # Legacy name kept for env compatibility (MAX_DATES_PER_CINEMA); the
+    # project now monitors one cinema, so this caps dates per cycle. The
+    # default covers VOX's entire advance-sale horizon (currently ~13
+    # dates); the cycle time budget is the real safety limit.
+    max_dates_per_cinema: int = 60
     max_retries: int = 1
-    cinema_slugs_override: tuple[str, ...] | None = field(default=None)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -45,10 +48,6 @@ class Settings:
             raise ConfigError(
                 "Missing required environment variables: " + ", ".join(missing)
             )
-        override_raw = (e.get("CINEMA_SLUGS") or "").strip()
-        override: tuple[str, ...] | None = None
-        if override_raw:
-            override = tuple(s.strip() for s in override_raw.split(",") if s.strip())
         return cls(
             telegram_bot_token=e["TELEGRAM_BOT_TOKEN"],
             telegram_chat_id=e["TELEGRAM_CHAT_ID"],
@@ -62,9 +61,8 @@ class Settings:
             request_timeout=_float_env(e, "REQUEST_TIMEOUT", 12.0),
             cycle_budget_seconds=_float_env(e, "CYCLE_BUDGET_SECONDS", 45.0),
             politeness_delay=_float_env(e, "POLITENESS_DELAY", 0.4),
-            max_dates_per_cinema=_int_env(e, "MAX_DATES_PER_CINEMA", 21),
+            max_dates_per_cinema=_int_env(e, "MAX_DATES_PER_CINEMA", 60),
             max_retries=_int_env(e, "MAX_RETRIES", 1),
-            cinema_slugs_override=override,
         )
 
 
@@ -88,30 +86,20 @@ def _float_env(e: dict[str, str], name: str, default: float) -> float:
         raise ConfigError(f"Environment variable {name} must be a number")
 
 
-def showtimes_url(
-    cinema_slug: str, movie_slugs: tuple[str, ...], date: str | None = None
-) -> str:
+def showtimes_url(cinema_slug: str, date: str | None = None) -> str:
+    """Showtimes URL for a cinema date.
+
+    Deliberately NO ``m=`` (movie) parameters: omitting them makes VOX
+    render every movie playing at that cinema for the date, which is how
+    the monitor discovers all films automatically instead of a fixed list.
+    """
     from urllib.parse import urlencode
 
     params: list[tuple[str, str]] = [("c", cinema_slug)]
-    params += [("m", s) for s in movie_slugs]
     if date:
         params.append(("d", date))
     return f"{BASE_URL}/showtimes?{urlencode(params)}"
 
 
-def showtimes_page_url(cinema_slug: str, movie_slug: str, date: str) -> str:
-    from urllib.parse import urlencode
-
-    return (
-        f"{BASE_URL}/showtimes?"
-        + urlencode([("c", cinema_slug), ("m", movie_slug), ("d", date)])
-    )
-
-
 def booking_url(session_id: str) -> str:
     return f"{BASE_URL}/booking/{session_id}"
-
-
-def is_safe_slug(slug: str) -> bool:
-    return bool(slug) and all(c.isalnum() or c in "-_" for c in slug)

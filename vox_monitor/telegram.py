@@ -31,7 +31,7 @@ def format_alert_message(sessions: list[Session]) -> str:
     """Build one message for a batch of newly bookable sessions."""
     if not sessions:
         raise ValueError("no sessions")
-    lines = ["🎬 AVENGERS: DOOMSDAY — TICKETS AVAILABLE", ""]
+    lines = ["🎬 NEW TICKETS AVAILABLE", ""]
     for s in sessions:
         lines.append(f"🎥 Movie: {s.movie_name}")
         lines.append(f"📍 Cinema: {s.cinema_name}")

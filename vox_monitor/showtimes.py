@@ -1,20 +1,23 @@
 """Server-rendered VOX showtimes page parser.
 
-Verified page structure (egy.voxcinemas.com/showtimes?c=...&m=...&d=...):
+Verified page structure (egy.voxcinemas.com/showtimes?c=...&d=...):
 
     <section class="showtimes">
       <h1>...
         <form class="auto-submit" action="/showtimes" method="get">
           <input type="hidden" name="c" value="city-centre-almaza"/>
-          <input type="hidden" name="m" value="..."/>   (repeatable)
           <input type="hidden" name="d" value="20261223"/>
+        </form>
       </h1>
       <nav class="date-filter">
         <a href="/showtimes?...&d=20261216">Wed 16 Dec</a> ...
         <span>Wed 23 Dec</span>            <- current date is not a link
       </nav>
-      <article class="movie-compare" data-slug="avengers-doomsday-infinity-vision">
-        <aside class="movie-hero"><div><h2>Name</h2>...</div></aside>
+      <article class="movie-compare" data-slug="clayface">
+        <aside class="movie-hero">
+          <img class="hero" src="https://assets.voxcinemas.com/heroes/B_HO00013587_...jpg"/>
+          <div><h2>Clayface</h2>...</div>
+        </aside>
         <div class="dates">
           <h3 class="highlight">City Centre Almaza</h3>
           <ol class="showtimes">
@@ -33,7 +36,14 @@ Verified page structure (egy.voxcinemas.com/showtimes?c=...&m=...&d=...):
           </ol>
         </div>
       </article>
+      ... one article per movie playing at this cinema on this date ...
     </section>
+
+Movie discovery: the page is requested WITHOUT ``m=`` parameters, so every
+movie playing at the cinema for that date is listed as its own article.
+Slug comes from ``data-slug``, display name from the article ``<h2>``, and
+movie id from the hero image ``B_<HO id>_`` — all page-derived, nothing
+hardcoded, so new films appear automatically and finished ones disappear.
 
 Availability contract (server-side, rendered by VOX itself):
   * ``<a class="action showtime" href=".../booking/ID">``  -> BOOKABLE
@@ -49,17 +59,23 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin
 
 from .config import BASE_URL, booking_url
-from .models import Availability, Cinema, Session, ShowtimePage
-from .movies import by_slug
+from .models import Availability, Session, ShowtimePage
+from .movies import Movie
 
 _D_PARAM_RE = re.compile(r"[?&]d=(\d{8})")
+_HERO_ID_RE = re.compile(r"B_(HO\d{8})_")
 
 
 class _RawSession:
-    __slots__ = ("movie_slug", "cinema_name", "fmt", "time_label", "session_id", "availability", "href")
+    __slots__ = (
+        "movie_slug", "movie_name", "movie_id",
+        "cinema_name", "fmt", "time_label", "session_id", "availability", "href",
+    )
 
     def __init__(self) -> None:
         self.movie_slug: str = ""
+        self.movie_name: str = ""
+        self.movie_id: str = ""
         self.cinema_name: str = ""
         self.fmt: str = ""
         self.time_label: str = ""
@@ -75,12 +91,16 @@ class ShowtimesParser(HTMLParser):
         self.nav_dates: list[str] = []
         self.raw_sessions: list[_RawSession] = []
         self.empty_state = False
+        # slug -> [name, movie_id] as seen on this page's articles
+        self.movies_by_slug: dict[str, list[str]] = {}
 
         self._stack: list[tuple[str, frozenset[str]]] = []
         self._in_date_nav = False
         self._nav_href: str | None = None
         self._in_movie = False
         self._movie_slug: str = ""
+        self._article_name = ""
+        self._article_ho = ""
         self._capture_movie_name = False
         self._movie_name_parts: list[str] = []
         self._current_cinema_name = ""
@@ -136,6 +156,15 @@ class ShowtimesParser(HTMLParser):
         if tag == "article" and "movie-compare" in classes:
             self._in_movie = True
             self._movie_slug = self._attr(attrs, "data-slug") or ""
+            self._article_name = ""
+            self._article_ho = ""
+
+        if tag == "img" and self._in_movie and "hero" in classes and not self._article_ho:
+            # Hero image carries the movie id: .../heroes/B_<HO id>_<ts>.jpg
+            src = self._attr(attrs, "src") or ""
+            m = _HERO_ID_RE.search(src)
+            if m:
+                self._article_ho = m.group(1)
 
         if tag == "h2" and self._in_movie:
             self._capture_movie_name = True
@@ -213,6 +242,9 @@ class ShowtimesParser(HTMLParser):
             self._in_form = False
 
         if tag == "h2" and self._capture_movie_name:
+            name = " ".join("".join(self._movie_name_parts).split())
+            if name and not self._article_name:
+                self._article_name = name
             self._capture_movie_name = False
 
         if tag == "h3" and self._capture_cinema_name:
@@ -229,6 +261,8 @@ class ShowtimesParser(HTMLParser):
             self._session.time_label = " ".join("".join(self._time_parts).split()).lower()
             self._session.fmt = self._format
             self._session.cinema_name = self._current_cinema_name
+            self._session.movie_name = self._article_name
+            self._session.movie_id = self._article_ho
             self.raw_sessions.append(self._session)
             self._session = None
             self._session_li_depth = -1
@@ -236,8 +270,18 @@ class ShowtimesParser(HTMLParser):
             self._time_parts = []
 
         if tag == "article":
+            if self._in_movie and self._movie_slug:
+                entry = self.movies_by_slug.setdefault(self._movie_slug, ["", ""])
+                if self._article_name and not entry[0]:
+                    entry[0] = self._article_name
+                if self._article_ho and not entry[1]:
+                    entry[1] = self._article_ho
             self._in_movie = False
             self._movie_slug = ""
+            self._article_name = ""
+            self._article_ho = ""
+            self._capture_movie_name = False
+            self._movie_name_parts = []
 
         if tag == "ol" and self._in_base_ol and len(self._stack) == self._base_ol_depth:
             self._in_base_ol = False
@@ -270,9 +314,8 @@ def parse_showtimes_page(
     date = requested_date or parser.default_date or ""
     sessions: list[Session] = []
     for raw in parser.raw_sessions:
-        movie = by_slug(raw.movie_slug)
-        movie_name = movie.name if movie else (raw.movie_slug or "UNKNOWN")
-        movie_id = movie.movie_id if movie else "UNKNOWN"
+        movie_name = raw.movie_name or raw.movie_slug or "UNKNOWN"
+        movie_id = raw.movie_id or raw.movie_slug or "UNKNOWN"
         if raw.availability == Availability.BOOKABLE:
             url = raw.href or booking_url(raw.session_id)
             booking = urljoin(BASE_URL, url)
@@ -294,54 +337,15 @@ def parse_showtimes_page(
             )
         )
 
+    movies = [
+        Movie(slug=slug, name=entry[0], movie_id=entry[1])
+        for slug, entry in parser.movies_by_slug.items()
+    ]
     nav_dates = sorted(set(parser.nav_dates))
     return ShowtimePage(
         cinema_slug=cinema_slug,
         date=date,
         sessions=sessions,
         nav_dates=nav_dates,
+        movies=movies,
     )
-
-
-def parse_cinemas_page(html: str) -> list[Cinema]:
-    """Extract cinemas from https://egy.voxcinemas.com/cinemas."""
-    found: dict[str, str] = {}
-    parser = _CinemasParser(found)
-    try:
-        parser.feed(html)
-        parser.close()
-    except Exception:
-        pass
-    return [Cinema(slug=s, name=n) for s, n in found.items()]
-
-
-class _CinemasParser(HTMLParser):
-    def __init__(self, found: dict[str, str]) -> None:
-        super().__init__(convert_charrefs=True)
-        self._found = found
-        self._href: str | None = None
-        self._parts: list[str] = []
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        if tag.lower() != "a" or self._href is not None:
-            return
-        for name, value in attrs:
-            if name == "href" and value and value.startswith("/cinemas/"):
-                slug = value[len("/cinemas/") :].strip("/")
-                if slug and "/" not in slug and "?" not in slug:
-                    self._href = slug
-                    self._parts = []
-
-    def handle_data(self, data: str) -> None:
-        if self._href is not None:
-            self._parts.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "a" and self._href is not None:
-            name = " ".join("".join(self._parts).split())
-            if name and self._href not in self._found:
-                self._found[self._href] = name
-            self._href = None
-            self._parts = []

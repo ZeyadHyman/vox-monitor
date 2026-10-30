@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
+from .movies import Movie
+
 
 class Availability(str, Enum):
     BOOKABLE = "bookable"
@@ -58,6 +60,9 @@ class ShowtimePage:
     date: str  # YYYYMMDD; may be "" if unknown
     sessions: list[Session] = field(default_factory=list)
     nav_dates: list[str] = field(default_factory=list)  # YYYYMMDD dates offered by VOX
+    # Movies listed on this page (article slug/name/id), including movies
+    # that have no sessions at all for this date.
+    movies: list[Movie] = field(default_factory=list)
 
 
 @dataclass
@@ -92,6 +97,7 @@ class CycleReport:
     partial: bool = False
     dry_run: bool = False
     cinemas_checked: int = 0
+    movies_discovered: int = 0
     pages_fetched: int = 0
     pages_failed: int = 0
     sessions_seen: int = 0
