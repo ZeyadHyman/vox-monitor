@@ -184,3 +184,96 @@ def test_check_with_valid_secret_reaches_cycle(monkeypatch):
     assert status == 200
     assert body["ok"] is True
     assert calls["cycle"] == 1
+
+
+# ---- root exception must be surfaced (redacted), not hidden --------------
+
+
+def test_internal_error_logs_full_traceback_with_secrets_redacted(
+    monkeypatch, capsys
+):
+    """Regression: the 500 catch-all previously swallowed the ImportError
+    from missing curl_cffi, leaving zero diagnostic evidence in Vercel logs."""
+    _set_check_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-token-live-556677")
+    monkeypatch.setenv("UPSTASH_REDIS_REST_TOKEN", "redis-secret-98765")
+    import api.check as check_module
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+    class _FakeStore:
+        def __init__(self, *a, **k):
+            pass
+
+    class _FakeNotifier:
+        def __init__(self, *a, **k):
+            pass
+
+    def _exploding_cycle(*a, **k):
+        raise ModuleNotFoundError(
+            "No module named 'curl_cffi' while using redis-secret-98765 "
+            "and bot-token-live-556677"
+        )
+
+    monkeypatch.setattr(check_module, "VoxHttpClient", _FakeClient)
+    monkeypatch.setattr(check_module, "RedisRestStore", _FakeStore)
+    monkeypatch.setattr(check_module, "TelegramNotifier", _FakeNotifier)
+    monkeypatch.setattr(check_module, "run_cycle", _exploding_cycle)
+
+    status, body = run_handler(
+        check_handler, "/api/check", {"x-monitor-secret": "right-secret"}
+    )
+
+    # Response stays generic — no internals leaked to the client.
+    assert status == 500
+    assert body == {"ok": False, "error": "internal error"}
+
+    # But the runtime log now carries the exact exception and traceback.
+    logged = capsys.readouterr().err
+    assert "ModuleNotFoundError" in logged
+    assert "No module named 'curl_cffi'" in logged
+    assert "Traceback (most recent call last)" in logged
+    # ... with environment secret values redacted.
+    assert "redis-secret-98765" not in logged
+    assert "bot-token-live-556677" not in logged
+    assert "[REDACTED:UPSTASH_REDIS_REST_TOKEN]" in logged
+    assert "[REDACTED:TELEGRAM_BOT_TOKEN]" in logged
+    assert "right-secret" not in logged  # MONITOR_SECRET never in logs
+
+
+def test_redact_masks_all_secret_env_values(monkeypatch):
+    import api.check as check_module
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-token-abcdef")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat-id-123456")
+    monkeypatch.setenv("UPSTASH_REDIS_REST_URL", "https://redis.internal.example")
+    monkeypatch.setenv("UPSTASH_REDIS_REST_TOKEN", "redis-token-xyz")
+    monkeypatch.setenv("MONITOR_SECRET", "monitor-secret-1")
+    monkeypatch.setenv("CRON_SECRET", "cron-secret-2")
+
+    text = (
+        "failed bot-token-abcdef at https://redis.internal.example "
+        "with redis-token-xyz chat-id-123456 monitor-secret-1 cron-secret-2"
+    )
+    redacted = check_module._redact(text)
+    for secret in (
+        "bot-token-abcdef",
+        "chat-id-123456",
+        "https://redis.internal.example",
+        "redis-token-xyz",
+        "monitor-secret-1",
+        "cron-secret-2",
+    ):
+        assert secret not in redacted
+    assert "[REDACTED:TELEGRAM_BOT_TOKEN]" in redacted
+    assert "[REDACTED:UPSTASH_REDIS_REST_URL]" in redacted
+
+
+def test_redact_skips_empty_or_trivial_values(monkeypatch):
+    import api.check as check_module
+
+    # Short/empty values must not cause mangling of ordinary text.
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
+    assert check_module._redact("ok call") == "ok call"

@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import hmac
 import json
+import os
+import sys
+import traceback
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
@@ -29,6 +32,29 @@ from vox_monitor.state import RedisRestStore
 from vox_monitor.telegram import TelegramNotifier
 
 _HEALTH_PATHS = frozenset({"/api/health", "/health"})
+
+_SECRET_ENV_NAMES = (
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "UPSTASH_REDIS_REST_URL",
+    "UPSTASH_REDIS_REST_TOKEN",
+    "MONITOR_SECRET",
+    "CRON_SECRET",
+)
+
+
+def _redact(text: str) -> str:
+    """Strip environment secret values from text destined for logs."""
+    for name in _SECRET_ENV_NAMES:
+        value = os.environ.get(name) or ""
+        if len(value) >= 4 and value in text:
+            text = text.replace(value, f"[REDACTED:{name}]")
+    return text
+
+
+def _log_exception() -> None:
+    """Surface the full root exception to runtime logs, secrets redacted."""
+    print(_redact(traceback.format_exc()), file=sys.stderr, flush=True)
 
 
 def _is_health_path(raw_path: str) -> bool:
@@ -78,7 +104,9 @@ class handler(BaseHTTPRequestHandler):
             notifier = TelegramNotifier(settings.telegram_bot_token, chat_id)
             report = run_cycle(settings, client, store, notifier)
         except Exception:
-            # Never leak internals or secrets.
+            # Surface the exact exception (type + traceback) to runtime logs
+            # with environment secrets redacted; never leak it in the response.
+            _log_exception()
             self._json(500, {"ok": False, "error": "internal error"})
             return
 

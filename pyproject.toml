@@ -1,3 +1,17 @@
+[project]
+name = "vox-monitor"
+version = "2.0.0"
+description = "VOX Cinemas Egypt advance-ticket monitor with Telegram alerts"
+requires-python = ">=3.12"
+# NOTE: Vercel's Python build installs dependencies from this table
+# ("Installing required dependencies from pyproject.toml"). Keeping the
+# dependency only in requirements.txt silently skips installation and
+# breaks the runtime import. Guarded by
+# tests/test_dependencies_declared_for_vercel_build.
+dependencies = [
+    "curl_cffi>=0.11.0,<0.18",
+]
+
 [tool.vercel]
 entrypoint = "api.check:handler"
 
