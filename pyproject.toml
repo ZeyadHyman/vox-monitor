@@ -18,3 +18,6 @@ entrypoint = "api.check:handler"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "integration: requires real Upstash Redis REST credentials (env vars or gitignored .env.integration)",
+]

@@ -1,5 +1,15 @@
+import json
+
+import pytest
+
 from vox_monitor.models import Availability, Session, SessionState
-from vox_monitor.state import MemoryStore, decide_updates, stamp_notified
+from vox_monitor.state import (
+    MemoryStore,
+    RedisRestStore,
+    StateError,
+    decide_updates,
+    stamp_notified,
+)
 
 NOW = "2026-10-30T12:00:00+00:00"
 LATER = "2026-10-30T12:05:00+00:00"
@@ -146,3 +156,111 @@ def test_memory_store_roundtrip():
     store.save_states(decision.updates)
     loaded = store.load_states()
     assert loaded[s.key].status == "bookable"
+
+
+def test_full_sequence_alerts_only_on_real_changes():
+    """Repeated identical scans must never resend; only transitions alert."""
+    known: dict[str, SessionState] = {}
+    total_alerts = 0
+
+    def cycle(availability, ts):
+        nonlocal total_alerts
+        decision = decide_updates([make_session(availability=availability)], known, ts)
+        total_alerts += len(decision.to_alert)
+        stamp_notified(decision.updates, decision.notified_keys, ts)
+        known.update(decision.updates)
+        return decision
+
+    # 1) first appearance (bookable) -> alert
+    assert len(cycle(Availability.BOOKABLE, NOW).to_alert) == 1
+    # 2-3) repeated identical scans -> deduplicated, no resend
+    assert cycle(Availability.BOOKABLE, LATER).to_alert == []
+    assert cycle(Availability.BOOKABLE, LATER).to_alert == []
+    # 4) goes unavailable -> update only
+    assert cycle(Availability.UNAVAILABLE, LATER).to_alert == []
+    # 5) returns to bookable -> re-alert exactly once
+    assert len(cycle(Availability.BOOKABLE, LATER).to_alert) == 1
+    # 6) repeated scan again -> deduplicated
+    assert cycle(Availability.BOOKABLE, LATER).to_alert == []
+    assert total_alerts == 2
+    final = known[make_session().key]
+    assert final.status == "bookable"
+    assert final.notified_at == LATER
+    assert final.first_seen == NOW
+
+
+def test_redis_store_default_keys_match_production():
+    store = RedisRestStore("https://example.upstash.io", "token-example")
+    assert store.sessions_key == "vox:doomsday:sessions"
+    assert store.lock_key == "vox:doomsday:lock"
+
+
+def test_redis_store_custom_prefix_isolates_test_namespace():
+    store = RedisRestStore(
+        "https://example.upstash.io", "token-example", key_prefix="test:vox-monitor:"
+    )
+    assert store.sessions_key == "test:vox-monitor:sessions"
+    assert store.lock_key == "test:vox-monitor:lock"
+
+
+def test_malformed_url_raises_state_error_not_bare_exception():
+    # Regression: Request() used to be built outside the try block, so a
+    # bad URL escaped as a bare ValueError and crashed the monitoring cycle.
+    store = RedisRestStore("not-a-url", "token-example")
+    with pytest.raises(StateError):
+        store.load_states()
+
+
+def _state_json(notified=True):
+    return json.dumps(
+        SessionState(
+            status="bookable",
+            first_seen=NOW,
+            last_seen=NOW,
+            notified_at=NOW if notified else None,
+        ).to_json()
+    )
+
+
+def test_load_states_accepts_dict_shaped_hgetall():
+    store = RedisRestStore("https://example.upstash.io", "token-example")
+    store._command = lambda command: {"field-a": _state_json()}
+    states = store.load_states()
+    assert states["field-a"].status == "bookable"
+    assert states["field-a"].notified_at == NOW
+
+
+def test_load_states_accepts_flat_list_shaped_hgetall():
+    # Regression: the REAL Upstash REST instance returns HGETALL as a flat
+    # RESP list [field, value, ...]; the old dict-only parser silently
+    # returned {} and destroyed dedup in production.
+    store = RedisRestStore("https://example.upstash.io", "token-example")
+    store._command = lambda command: ["field-a", _state_json(), "field-b", _state_json(False)]
+    states = store.load_states()
+    assert states["field-a"].notified_at == NOW
+    assert states["field-b"].notified_at is None
+
+
+def test_load_states_skips_corrupt_entries_but_keeps_valid_ones():
+    store = RedisRestStore("https://example.upstash.io", "token-example")
+    store._command = lambda command: [
+        "bad-json",
+        "not-json{{",
+        "good",
+        _state_json(),
+        "non-dict-json",
+        '"just a string"',
+        "mismatched",
+        "x",
+    ]
+    states = store.load_states()
+    assert list(states) == ["good"]
+    assert states["good"].status == "bookable"
+
+
+def test_load_states_returns_empty_on_unexpected_shapes():
+    store = RedisRestStore("https://example.upstash.io", "token-example")
+    store._command = lambda command: ["only-one-element"]
+    assert store.load_states() == {}
+    store._command = lambda command: None
+    assert store.load_states() == {}

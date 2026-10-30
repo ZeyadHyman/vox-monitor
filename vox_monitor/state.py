@@ -39,9 +39,23 @@ class SessionStore(Protocol):
 
 
 class RedisRestStore:
-    """Upstash Redis REST API client (JSON command protocol)."""
+    """Upstash Redis REST API client (JSON command protocol).
 
-    def __init__(self, url: str, token: str, timeout: float = 15.0) -> None:
+    ``key_prefix`` isolates namespaces: production uses the default
+    ``vox:doomsday:`` (keys ``vox:doomsday:sessions`` / ``vox:doomsday:lock``),
+    integration tests use ``test:vox-monitor:`` so they can never touch or
+    delete production state.
+    """
+
+    DEFAULT_PREFIX = "vox:doomsday:"
+
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        timeout: float = 15.0,
+        key_prefix: str = DEFAULT_PREFIX,
+    ) -> None:
         try:
             import urllib.request
         except ImportError:  # pragma: no cover
@@ -50,18 +64,31 @@ class RedisRestStore:
         self._url = url.rstrip("/")
         self._token = token
         self._timeout = timeout
+        self._sessions_key = key_prefix + "sessions"
+        self._lock_key = key_prefix + "lock"
+
+    @property
+    def sessions_key(self) -> str:
+        return self._sessions_key
+
+    @property
+    def lock_key(self) -> str:
+        return self._lock_key
 
     def _command(self, command: list[Any]) -> Any:
-        req = self._urllib.Request(
-            self._url,
-            data=json.dumps(command).encode("utf-8"),
-            headers={
-                "Authorization": "Bearer " + self._token,
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
         try:
+            # Request construction must be inside the try: a malformed URL
+            # raises ValueError and must surface as StateError, never as an
+            # unhandled exception that crashes the monitoring cycle.
+            req = self._urllib.Request(
+                self._url,
+                data=json.dumps(command).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer " + self._token,
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
             with self._urllib.urlopen(req, timeout=self._timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
@@ -71,31 +98,55 @@ class RedisRestStore:
         return payload.get("result") if isinstance(payload, dict) else None
 
     def acquire_lock(self, ttl_seconds: int) -> bool:
-        result = self._command(["SET", "vox:doomsday:lock", "1", "NX", "EX", ttl_seconds])
+        result = self._command(
+            ["SET", self._lock_key, "1", "NX", "EX", ttl_seconds]
+        )
         return result == "OK"
 
     def release_lock(self) -> None:
-        self._command(["DEL", "vox:doomsday:lock"])
+        self._command(["DEL", self._lock_key])
 
     def load_states(self) -> dict[str, SessionState]:
-        raw = self._command(["HGETALL", "vox:doomsday:sessions"])
+        raw = self._command(["HGETALL", self._sessions_key])
         states: dict[str, SessionState] = {}
+        # Real Upstash REST instances differ: some return an object
+        # {"field": "json"} and others a flat RESP-style list
+        # ["field", "json", "field", "json", ...]. Both shapes must parse,
+        # otherwise the hash silently reads back as empty and dedup breaks.
         if isinstance(raw, dict):
-            for key, value in raw.items():
-                try:
-                    states[str(key)] = SessionState.from_json(json.loads(value))
-                except Exception:
-                    continue  # skip corrupt entries, keep the rest
+            items: list[tuple[Any, Any]] = list(raw.items())
+        elif isinstance(raw, list) and len(raw) % 2 == 0:
+            items = list(zip(raw[0::2], raw[1::2]))
+        else:
+            items = []
+        for key, value in items:
+            try:
+                data = json.loads(value) if isinstance(value, str) else value
+                if not isinstance(data, dict):
+                    continue
+                states[str(key)] = SessionState.from_json(data)
+            except Exception:
+                continue  # skip corrupt entries, keep the rest
         return states
 
     def save_states(self, entries: dict[str, SessionState]) -> None:
         if not entries:
             return
-        command: list[Any] = ["HSET", "vox:doomsday:sessions"]
+        command: list[Any] = ["HSET", self._sessions_key]
         for key, state in entries.items():
             command.append(key)
             command.append(json.dumps(state.to_json(), ensure_ascii=False))
         self._command(command)
+
+    def clear_states(self) -> int:
+        """Delete this store's sessions hash.
+
+        Scoped to the configured key prefix, so tests using
+        ``test:vox-monitor:`` can reset their own state without ever
+        touching the production hash.
+        """
+        result = self._command(["DEL", self._sessions_key])
+        return int(result) if isinstance(result, (int, float)) else 0
 
 
 class MemoryStore:
