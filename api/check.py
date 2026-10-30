@@ -1,9 +1,18 @@
-"""Protected monitoring endpoint: GET /api/check
+"""Monitoring endpoint + public liveness, deployed as the Vercel entrypoint.
 
-Authentication (constant-time compared, never echoed):
+Routes (served regardless of Vercel routing mode):
+  * GET /api/health, /health  -> 200 {"ok": true}   PUBLIC, no auth
+  * GET /api/check            -> protected monitoring cycle
+
+Authentication for /api/check (constant-time compared, never echoed):
   * Header ``x-monitor-secret: <MONITOR_SECRET>`` (external schedulers), or
   * Header ``Authorization: Bearer <CRON_SECRET>`` (Vercel Cron; falls back
     to MONITOR_SECRET if CRON_SECRET is unset).
+
+Note: ``pyproject.toml`` sets ``tool.vercel.entrypoint = "api.check:handler"``,
+so Vercel routes every path through this handler. Health requests must be
+answered here (before any env/config access) or they would fall into the
+monitoring auth path.
 """
 
 from __future__ import annotations
@@ -11,12 +20,20 @@ from __future__ import annotations
 import hmac
 import json
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 from vox_monitor.config import ConfigError, Settings
 from vox_monitor.http import VoxHttpClient
 from vox_monitor.orchestrator import run_cycle
 from vox_monitor.state import RedisRestStore
 from vox_monitor.telegram import TelegramNotifier
+
+_HEALTH_PATHS = frozenset({"/api/health", "/health"})
+
+
+def _is_health_path(raw_path: str) -> bool:
+    path = urlparse(raw_path or "/").path.rstrip("/") or "/"
+    return path in _HEALTH_PATHS
 
 
 def _secret_ok(header_value: str | None, expected: str | None) -> bool:
@@ -27,6 +44,11 @@ def _secret_ok(header_value: str | None, expected: str | None) -> bool:
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        if _is_health_path(self.path):
+            # Public liveness only: no auth, no env vars, no internals.
+            self._json(200, {"ok": True})
+            return
+
         try:
             settings = Settings.from_env()
         except ConfigError as exc:
