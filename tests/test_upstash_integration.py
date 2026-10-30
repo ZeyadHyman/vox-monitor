@@ -181,12 +181,58 @@ def test_cleanup_removes_only_test_prefixed_keys():
     case_id = _new_case_id()
     code, _ = _run_probe("write", case_id)
     assert code == 0
+    code, _ = _run_probe("baseline-set", case_id)
+    assert code == 0
     assert _test_store().load_states() != {}
+    assert _test_store().get_baseline() is not None
     code, payload = _run_probe("cleanup")
     assert code == 0, payload
     assert _test_store().load_states() == {}
+    assert _test_store().get_baseline() is None  # marker scoped + cleaned too
     # Production hash still readable (read-only) — no exception, no deletion.
     _production_store().load_states()
+
+
+def test_baseline_marker_persists_across_processes():
+    """The baseline marker written in one process is read back in a brand-new
+    process — real Upstash persistence for the Initial Baseline flag."""
+    case_id = _new_case_id()
+    expected = f"baseline-{case_id}-2026-10-30T12:00:00+00:00"
+    code, payload = _run_probe("baseline-set", case_id)
+    assert code == 0, payload
+    # Fresh interpreter (child) verifies its own write ...
+    code, payload = _run_probe("baseline-get", case_id)
+    assert code == 0 and payload.get("ok") is True, payload
+    # ... and this parent process sees the marker too.
+    assert _test_store().get_baseline() == expected
+
+
+def test_baseline_flow_sessions_and_marker_verified_across_processes():
+    """Emulated baseline cycle in a child process: sessions saved (stamped)
+    BEFORE the marker; a fresh process must see both, and the saved bookable
+    session must produce ZERO alerts (no mass re-notification)."""
+    from vox_monitor.state import decide_updates
+
+    case_id = _new_case_id()
+    code, payload = _run_probe("baseline-flow", case_id)
+    assert code == 0, payload
+    field = payload["field"]
+
+    store = _test_store()
+    assert store.get_baseline() is not None  # marker visible cross-process
+    states = store.load_states()
+    assert field in states, "baseline session missing after restart"
+    state = states[field]
+    assert state.status == "bookable"
+    assert state.notified_at is not None  # stamped as handled during baseline
+
+    # Recompute the alert decision exactly like the next cycle would.
+    from integration_probe import make_session
+    from vox_monitor.models import Availability
+
+    session = make_session(case_id, Availability.BOOKABLE)
+    decision = decide_updates([session], states, "2026-10-30T13:00:00+00:00")
+    assert decision.to_alert == [], "baseline-saved session must never re-alert"
 
 
 def test_production_state_never_contains_test_keys():
@@ -196,7 +242,12 @@ def test_production_state_never_contains_test_keys():
     assert leaked == [], f"test fields leaked into production: {leaked}"
     leaked_cases = [cid for cid in USED_CASE_IDS if any(cid in key for key in prod)]
     assert leaked_cases == [], f"case ids leaked into production: {leaked_cases}"
+    # Production baseline marker (if ever legitimately written) must never
+    # carry test case data; while no approved baseline has run, it is absent.
+    prod_baseline = _production_store().get_baseline()
+    assert prod_baseline is None or not any(cid in prod_baseline for cid in USED_CASE_IDS)
     # Test namespace is fully cleaned up.
     store = _test_store()
     assert store.load_states() == {}
+    assert store.get_baseline() is None
     assert store._command(["GET", store.lock_key]) in (None, "")

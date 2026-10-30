@@ -20,6 +20,24 @@ Notification rules (see ``decide_updates``):
   * UNAVAILABLE / UNKNOWN                  -> update only, never alert
 
 A cycle lock (``vox:monitor:lock``, SET NX EX) prevents overlapping runs.
+
+Initial Baseline
+---------------
+An empty state + a live site would otherwise alert on every existing
+bookable session at once. A separate marker key ``vox:monitor:baseline``
+(plain string, completion timestamp) records that a first, complete,
+successful snapshot of all sessions has been persisted:
+
+  * marker absent  -> the cycle runs in BASELINE mode: sessions are saved
+    (bookable entries stamped ``notified_at``) but NO Telegram notification
+    is sent and nothing is counted as "new". The marker is written only if
+    every page was fetched without failure, the whole cycle did not hit the
+    time budget, and the state save succeeded.
+  * marker present  -> normal operation: alert on new bookable sessions and
+    on unavailable -> bookable transitions, deduplicated by ``notified_at``.
+
+The marker is its own key: existing keys (sessions hash, lock) are never
+renamed or cleared by the baseline mechanism.
 """
 
 from __future__ import annotations
@@ -41,15 +59,17 @@ class SessionStore(Protocol):
     def load_states(self) -> dict[str, SessionState]: ...
     def save_states(self, entries: dict[str, SessionState]) -> None: ...
     def remove_states(self, keys: list[str]) -> None: ...
+    def get_baseline(self) -> str | None: ...
+    def set_baseline(self, value: str) -> None: ...
 
 
 class RedisRestStore:
     """Upstash Redis REST API client (JSON command protocol).
 
     ``key_prefix`` isolates namespaces: production uses the default
-    ``vox:monitor:`` (keys ``vox:monitor:sessions`` / ``vox:monitor:lock``),
-    integration tests use ``test:vox-monitor:`` so they can never touch or
-    delete production state.
+    ``vox:monitor:`` (keys ``vox:monitor:sessions`` / ``vox:monitor:lock`` /
+    ``vox:monitor:baseline``), integration tests use ``test:vox-monitor:``
+    so they can never touch or delete production state.
     """
 
     DEFAULT_PREFIX = "vox:monitor:"
@@ -71,6 +91,7 @@ class RedisRestStore:
         self._timeout = timeout
         self._sessions_key = key_prefix + "sessions"
         self._lock_key = key_prefix + "lock"
+        self._baseline_key = key_prefix + "baseline"
 
     @property
     def sessions_key(self) -> str:
@@ -79,6 +100,10 @@ class RedisRestStore:
     @property
     def lock_key(self) -> str:
         return self._lock_key
+
+    @property
+    def baseline_key(self) -> str:
+        return self._baseline_key
 
     def _command(self, command: list[Any]) -> Any:
         try:
@@ -163,6 +188,24 @@ class RedisRestStore:
             return
         self._command(["HDEL", self._sessions_key, *keys])
 
+    def get_baseline(self) -> str | None:
+        """Completion timestamp of the initial baseline, or None."""
+        raw = self._command(["GET", self._baseline_key])
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        if isinstance(raw, str) and raw:
+            return raw
+        return None
+
+    def set_baseline(self, value: str) -> None:
+        """Record baseline completion (plain SET; only ever called after a
+        fully clean fetch + verified state save)."""
+        self._command(["SET", self._baseline_key, value])
+
+    def clear_baseline(self) -> None:
+        """Remove the baseline marker, scoped to this store's key prefix."""
+        self._command(["DEL", self._baseline_key])
+
 
 class MemoryStore:
     """In-memory store for tests and local dry runs."""
@@ -170,6 +213,7 @@ class MemoryStore:
     def __init__(self) -> None:
         self._states: dict[str, SessionState] = {}
         self._locked = False
+        self._baseline: str | None = None
 
     def acquire_lock(self, ttl_seconds: int) -> bool:
         if self._locked:
@@ -189,6 +233,12 @@ class MemoryStore:
     def remove_states(self, keys: list[str]) -> None:
         for key in keys:
             self._states.pop(key, None)
+
+    def get_baseline(self) -> str | None:
+        return self._baseline
+
+    def set_baseline(self, value: str) -> None:
+        self._baseline = value
 
 
 @dataclass

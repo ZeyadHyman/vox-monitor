@@ -16,6 +16,12 @@ Flow:
      failed pages contribute nothing, everything else proceeds. Entries
      whose date has passed are pruned separately, best-effort, never as a
      reaction to a failure.
+  7. Initial Baseline (state.py): while the ``vox:monitor:baseline`` marker
+     is absent the cycle persists every session WITHOUT sending any
+     Telegram notification and without counting anything as new. The marker
+     is written only after a fully clean fetch (no failed pages, no time
+     budget cancellation) and a successful state save; any fetch failure or
+     Redis failure keeps the baseline pending for the next cycle.
 """
 
 from __future__ import annotations
@@ -169,13 +175,18 @@ def _run_locked(
     report.bookable_seen = sum(1 for s in all_sessions if s.availability.value == "bookable")
 
     # State comparison. If state cannot be loaded, abort without alerting:
-    # a state failure must never cause duplicate notifications.
+    # a state failure must never cause duplicate notifications. The baseline
+    # marker rides in the same try: without knowing baseline status the cycle
+    # must not notify either (a lost marker would cause a mass alert).
     try:
         known = store.load_states()
+        baseline_at = store.get_baseline()
     except StateError:
         report.ok = False
         report.state_error = "load_failed"
         return report
+
+    baseline_pending = baseline_at is None
 
     # Prune state for dates that have passed (relative to this cycle's own
     # clock). Best-effort housekeeping with strict key parsing — never
@@ -191,6 +202,46 @@ def _run_locked(
                 report.errors.append("expired-state cleanup failed (non-fatal)")
 
     decision: Decision = decide_updates(all_sessions, known, ts)
+
+    if baseline_pending:
+        # INITIAL BASELINE MODE: persist everything, notify about nothing,
+        # treat no session as new. The marker is recorded only after a fully
+        # clean cycle + verified save (any fetch failure or Redis failure
+        # keeps baseline pending and the next cycle retries the same way).
+        report.awaiting_baseline = True
+        report.notified = False
+        if settings.dry_run:
+            # Dry runs never write state, so the baseline cannot complete
+            # here; report what the baseline cycle would persist instead.
+            return report
+        # Stamp every bookable session as already handled BEFORE saving, so
+        # a partially written baseline can never cause a mass alert later.
+        stamp_notified(decision.updates, decision.notified_keys, ts)
+        try:
+            store.save_states(decision.updates)
+        except StateError:
+            report.ok = False
+            report.state_error = "save_failed"
+            report.errors.append("state save failed; baseline not recorded")
+            return report
+        if report.pages_failed == 0 and not report.partial:
+            try:
+                store.set_baseline(ts)
+            except StateError:
+                report.ok = False
+                report.state_error = "baseline_save_failed"
+                report.errors.append(
+                    "baseline marker save failed; baseline not recorded"
+                )
+                return report
+            report.baseline_completed = True
+            report.awaiting_baseline = False
+        else:
+            report.errors.append(
+                "baseline pending: fetch incomplete; will retry next cycle"
+            )
+        return report
+
     report.new_bookable = [
         {
             "movie": s.movie_name,

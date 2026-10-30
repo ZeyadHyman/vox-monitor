@@ -286,3 +286,76 @@ def test_redis_store_remove_states_empty_is_noop():
     store = RedisRestStore("https://example.upstash.io", "token-example")
     store._command = lambda command: (_ for _ in ()).throw(AssertionError("must not call"))
     store.remove_states([])  # must not raise, must not issue a command
+
+
+# ---- Initial Baseline marker ----------------------------------------------
+
+
+def test_redis_store_baseline_key_defaults_to_production_namespace():
+    store = RedisRestStore("https://example.upstash.io", "token-example")
+    assert store.baseline_key == "vox:monitor:baseline"
+    # Existing keys are untouched by the new marker.
+    assert store.sessions_key == "vox:monitor:sessions"
+    assert store.lock_key == "vox:monitor:lock"
+
+
+def test_redis_store_baseline_key_uses_test_prefix():
+    store = RedisRestStore(
+        "https://example.upstash.io", "token-example", key_prefix="test:vox-monitor:"
+    )
+    assert store.baseline_key == "test:vox-monitor:baseline"
+
+
+def test_redis_store_get_baseline_none_when_absent():
+    store = RedisRestStore("https://example.upstash.io", "token-example")
+    store._command = lambda command: None
+    assert store.get_baseline() is None
+
+
+def test_redis_store_baseline_roundtrip_command_sequence():
+    store = RedisRestStore("https://example.upstash.io", "token-example")
+    seen: list[list] = []
+    results = iter(["OK", NOW])
+    store._command = lambda command: seen.append(command) or next(results)
+    store.set_baseline(NOW)
+    assert store.get_baseline() == NOW
+    assert seen == [
+        ["SET", "vox:monitor:baseline", NOW],
+        ["GET", "vox:monitor:baseline"],
+    ]
+
+
+def test_redis_store_get_baseline_decodes_bytes_and_ignores_empty():
+    store = RedisRestStore("https://example.upstash.io", "token-example")
+    store._command = lambda command: b"marker-ts"
+    assert store.get_baseline() == "marker-ts"
+    store._command = lambda command: ""
+    assert store.get_baseline() is None
+
+
+def test_redis_store_clear_baseline_is_scoped_to_prefix():
+    store = RedisRestStore(
+        "https://example.upstash.io", "token-example", key_prefix="test:vox-monitor:"
+    )
+    seen: list[list] = []
+    store._command = lambda command: seen.append(command) or 1
+    store.clear_baseline()
+    assert seen == [["DEL", "test:vox-monitor:baseline"]]
+
+
+def test_memory_store_baseline_roundtrip():
+    store = MemoryStore()
+    assert store.get_baseline() is None
+    store.set_baseline(NOW)
+    assert store.get_baseline() == NOW
+
+
+def test_baseline_marker_is_independent_of_session_state():
+    """Completing/clearing baseline never touches the sessions hash (req:
+    never clear or rename existing keys without a need)."""
+    store = MemoryStore()
+    store.save_states({"k": SessionState("bookable", NOW, NOW, NOW)})
+    store.set_baseline(NOW)
+    assert store.load_states().keys() == {"k"}
+    store.set_baseline("later")  # overwrite marker only
+    assert store.load_states()["k"].notified_at == NOW

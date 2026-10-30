@@ -13,6 +13,9 @@ Actions:
   verify <case_id>      - fresh read; compare every persisted field
   dedup <case_id>       - previously-notified bookable must NOT re-alert
   transition <case_id>  - bookable -> unavailable -> bookable re-alert cycle
+  baseline-set <id>     - record a baseline marker (test prefix only)
+  baseline-flow <id>    - baseline snapshot: save sessions + marker in one go
+  baseline-get <id>     - read the marker back in this fresh process
   lock-hold <seconds>   - acquire test-prefix lock, print HELD, hold, release
   lock-try              - attempt lock: reports ACQUIRED or BUSY
   cleanup               - delete ONLY test:vox-monitor:* keys
@@ -162,11 +165,36 @@ def action_lock_try(store: RedisRestStore) -> dict:
 
 
 def action_cleanup(store: RedisRestStore) -> dict:
-    # clear_states/release_lock are scoped to the store's own (test-prefix)
-    # keys, so this can never delete production data.
+    # clear_states/release_lock/clear_baseline are scoped to the store's own
+    # (test-prefix) keys, so this can never delete production data.
     sessions_deleted = store.clear_states()
     store.release_lock()
+    store.clear_baseline()
     return {"ok": True, "sessions_deleted": sessions_deleted}
+
+
+def action_baseline_set(store: RedisRestStore, case_id: str) -> dict:
+    store.set_baseline(f"baseline-{case_id}-{TS1}")
+    return {"ok": True, "marker": store.get_baseline()}
+
+
+def action_baseline_get(store: RedisRestStore, case_id: str) -> dict:
+    expected = f"baseline-{case_id}-{TS1}"
+    actual = store.get_baseline()
+    return {"ok": actual == expected, "marker": actual, "expected": expected}
+
+
+def action_baseline_flow(store: RedisRestStore, case_id: str) -> dict:
+    """Emulates the orchestrator's baseline cycle in one isolated process:
+    persist every session (bookable stamped as handled) and only then record
+    the baseline marker. A later process must observe BOTH."""
+    session = make_session(case_id, Availability.BOOKABLE)
+    state = SessionState(
+        status="bookable", first_seen=TS1, last_seen=TS1, notified_at=TS1
+    )
+    store.save_states({session.key: state})
+    store.set_baseline(f"baseline-{case_id}-{TS1}")
+    return {"ok": True, "field": session.key}
 
 
 def main() -> int:
@@ -189,6 +217,16 @@ def main() -> int:
                 "verify": action_verify,
                 "dedup": action_dedup,
                 "transition": action_transition,
+            }[action]
+            result = handler(store, case_id)
+        elif action in ("baseline-set", "baseline-get", "baseline-flow"):
+            if len(sys.argv) < 3:
+                raise ValueError("case_id required")
+            case_id = sys.argv[2]
+            handler = {
+                "baseline-set": action_baseline_set,
+                "baseline-get": action_baseline_get,
+                "baseline-flow": action_baseline_flow,
             }[action]
             result = handler(store, case_id)
         elif action == "lock-hold":

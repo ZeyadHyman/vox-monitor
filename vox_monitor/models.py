@@ -106,6 +106,11 @@ class CycleReport:
     notified: bool = False
     notify_error: str | None = None
     state_error: str | None = None
+    # Initial Baseline: awaiting_baseline = this cycle ran in baseline mode
+    # (no notifications at all); baseline_completed = the baseline marker was
+    # successfully recorded during THIS cycle (clean fetch + verified save).
+    awaiting_baseline: bool = False
+    baseline_completed: bool = False
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
