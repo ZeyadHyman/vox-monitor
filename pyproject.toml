@@ -1,2 +1,6 @@
 [tool.vercel]
 entrypoint = "api.check:handler"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

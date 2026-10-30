@@ -1,99 +1,84 @@
-import os, re, json, hashlib
-from datetime import datetime, timezone
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
-from html.parser import HTMLParser
+"""Protected monitoring endpoint: GET /api/check
 
-MOVIES = [
-    {"name": "Avengers: Doomsday", "url": "https://egy.voxcinemas.com/movies/avengers-doomsday"},
-    {"name": "Avengers: Doomsday (Infinity Vision)", "url": "https://egy.voxcinemas.com/movies/avengers-doomsday-infinity-vision"},
-]
-TIME_RE = re.compile(r"^\s*(\d{1,2}:\d{2}\s*(?:am|pm))\s*$", re.I)
+Authentication (constant-time compared, never echoed):
+  * Header ``x-monitor-secret: <MONITOR_SECRET>`` (external schedulers), or
+  * Header ``Authorization: Bearer <CRON_SECRET>`` (Vercel Cron; falls back
+    to MONITOR_SECRET if CRON_SECRET is unset).
+"""
 
-class TimeLinkParser(HTMLParser):
-    def __init__(self):
-        super().__init__(); self.links=[]; self.href=None; self.parts=[]
-        self.cinema=None; self.heading_tag=None; self.heading_parts=[]
-    def handle_starttag(self, tag, attrs):
-        tag=tag.lower()
-        if tag in ("h2", "h3", "h4"):
-            self.heading_tag=tag; self.heading_parts=[]
-        if tag=="a": self.href=dict(attrs).get("href"); self.parts=[]
-    def handle_data(self, data):
-        if self.href is not None: self.parts.append(data)
-        if self.heading_tag is not None: self.heading_parts.append(data)
-    def handle_endtag(self, tag):
-        tag=tag.lower()
-        if tag==self.heading_tag and self.heading_tag is not None:
-            heading=" ".join("".join(self.heading_parts).split())
-            if heading and heading.lower() not in ("showtimes", "avengers: doomsday", "avengers: doomsday - showtimes"):
-                self.cinema=heading
-            self.heading_tag=None; self.heading_parts=[]
-        if tag=="a" and self.href is not None:
-            label=" ".join("".join(self.parts).split()); href=self.href.strip()
-            if TIME_RE.match(label) and href and href!="#" and not href.lower().startswith("javascript:"):
-                if href.startswith("/"): href="https://egy.voxcinemas.com"+href
-                if href.startswith("http"):
-                    self.links.append({"cinema":self.cinema or "Cinema shown on VOX page", "time":label,"booking_url":href})
-            self.href=None; self.parts=[]
+from __future__ import annotations
 
-def http_get(url, headers=None):
-    req=Request(url,headers=headers or {"User-Agent":"Mozilla/5.0 (compatible; VOXBookingMonitor/1.0)"})
-    with urlopen(req,timeout=20) as r: return r.read().decode("utf-8",errors="replace")
-
-def redis(command):
-    req=Request(os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/"),data=json.dumps(command).encode(),headers={"Authorization":"Bearer "+os.environ["UPSTASH_REDIS_REST_TOKEN"],"Content-Type":"application/json"},method="POST")
-    with urlopen(req,timeout=15) as r: return json.loads(r.read().decode()).get("result")
-
-def telegram(message):
-    url="https://api.telegram.org/bot"+os.environ["TELEGRAM_BOT_TOKEN"]+"/sendMessage"
-    data=json.dumps({"chat_id":os.environ["TELEGRAM_CHAT_ID"],"text":message,"disable_web_page_preview":False}).encode()
-    result=json.loads(http_get(url,{"Content-Type":"application/json"}) if False else urlopen(Request(url,data=data,headers={"Content-Type":"application/json"}),timeout=15).read().decode())
-    if not result.get("ok"): raise RuntimeError("Telegram sendMessage failed")
-
+import hmac
+import json
 from http.server import BaseHTTPRequestHandler
 
+from vox_monitor.config import ConfigError, Settings
+from vox_monitor.http import VoxHttpClient
+from vox_monitor.orchestrator import run_cycle
+from vox_monitor.state import RedisRestStore
+from vox_monitor.telegram import TelegramNotifier
+
+
+def _secret_ok(header_value: str | None, expected: str | None) -> bool:
+    if not header_value or not expected:
+        return False
+    return hmac.compare_digest(header_value.encode(), expected.encode())
+
+
 class handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if not os.environ.get("MONITOR_SECRET") or self.headers.get("x-monitor-secret") != os.environ["MONITOR_SECRET"]:
-            self.send_json(401, {"ok": False, "error": "Unauthorized"}); return
+    def do_GET(self) -> None:
         try:
-            results = []
-            for movie in MOVIES:
-                parser = TimeLinkParser(); parser.feed(http_get(movie["url"]))
-                unique, seen = [], set()
-                for item in parser.links:
-                    key = (item.get("cinema"), item["time"], item["booking_url"])
-                    if key not in seen:
-                        seen.add(key); unique.append(item)
-                results.append({**movie, "showtimes": unique})
+            settings = Settings.from_env()
+        except ConfigError as exc:
+            # Message contains variable NAMES only, never values.
+            self._json(500, {"ok": False, "error": str(exc)})
+            return
 
-            bookable = [x for x in results if x["showtimes"]]
-            if not bookable:
-                self.send_json(200, {"ok": True, "notified": False, "message": "No clickable screening-time links found"}); return
+        supplied = self.headers.get("x-monitor-secret")
+        authorized = _secret_ok(supplied, settings.monitor_secret)
 
-            fingerprint = hashlib.sha256(json.dumps(bookable, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-            previous = redis(["GET", "vox:doomsday:last_fingerprint"])
-            if previous == fingerprint:
-                self.send_json(200, {"ok": True, "notified": False, "message": "No change; duplicate suppressed"}); return
+        if not authorized:
+            auth = self.headers.get("Authorization") or ""
+            bearer = auth[7:] if auth.startswith("Bearer ") else None
+            expected_bearer = settings.cron_secret or settings.monitor_secret
+            authorized = _secret_ok(bearer, expected_bearer)
 
-            lines = ["🎬 VOX: Avengers: Doomsday", "", "تم العثور على روابط مواعيد عروض على موقع VOX الرسمي.", "افتح الروابط وتأكد من العرض قبل الدفع."]
-            for movie in bookable:
-                lines += ["", "🎥 " + movie["name"], movie["url"]]
-                for show in movie["showtimes"][:30]:
-                    lines.append("• " + show.get("cinema", "") + " | " + show["time"] + " — " + show["booking_url"])
-            telegram("\n".join(lines))
-            redis(["SET", "vox:doomsday:last_fingerprint", fingerprint])
-            self.send_json(200, {"ok": True, "notified": True, "checked_at": datetime.now(timezone.utc).isoformat()})
-        except (HTTPError, URLError, TimeoutError) as exc:
-            self.send_json(502, {"ok": False, "error": "VOX/network error: " + str(exc)})
-        except Exception as exc:
-            self.send_json(500, {"ok": False, "error": str(exc)})
+        if not authorized:
+            self._json(401, {"ok": False, "error": "Unauthorized"})
+            return
 
-    def send_json(self, status, data):
+        try:
+            client = VoxHttpClient(
+                timeout=settings.request_timeout, max_retries=settings.max_retries
+            )
+            store = RedisRestStore(settings.redis_url, settings.redis_token)
+            chat_id = settings.test_chat_id or settings.telegram_chat_id
+            notifier = TelegramNotifier(settings.telegram_bot_token, chat_id)
+            report = run_cycle(settings, client, store, notifier)
+        except Exception:
+            # Never leak internals or secrets.
+            self._json(500, {"ok": False, "error": "internal error"})
+            return
+
+        if report.busy:
+            self._json(200, {"ok": True, "skipped": "cycle already running"})
+            return
+
+        status = 200
+        if not report.ok and report.state_error:
+            status = 503
+        elif not report.ok:
+            status = 502
+
+        self._json(status, report.to_dict())
+
+    def _json(self, status: int, data: dict) -> None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def log_message(self, fmt: str, *args) -> None:  # quiet default logging
+        pass

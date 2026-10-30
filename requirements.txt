@@ -1,1 +1,4 @@
-# Python standard library only.
+# Runtime dependencies (installed by Vercel).
+# curl_cffi provides Chrome TLS/HTTP2 impersonation required to reach
+# egy.voxcinemas.com behind Akamai bot filtering.
+curl_cffi>=0.11.0,<0.18
